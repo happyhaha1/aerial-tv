@@ -159,6 +159,16 @@ fun AppTile(
     showName: Boolean = true,
     /** The name sits on the glass plate, which ends just under it: it does not step down past the focus frame. */
     nameOnPlate: Boolean = false,
+    /**
+     * A dock tile: Up leaves the row for Home's Top Shelf instead of reaching the status pill, which
+     * the focus search would otherwise find across the screen. Set only when the hero is up.
+     */
+    dock: Boolean = false,
+    /**
+     * A tap or a press landed on this tile while the hero stands over the dock: Home stops showing
+     * the hero then, so the tap does what it would have done had the hero not been up.
+     */
+    onDockTouch: () -> Unit = {},
 ) {
     val reduced = LocalReducedMotion.current
     val scope = rememberCoroutineScope()
@@ -315,9 +325,12 @@ fun AppTile(
                         else -> null
                     }
                     if (dir != null) {
+                        if (dock && dir == FocusDirection.Up) return@onKeyEvent true
                         // A held key repeats: the wall is told once, on the first press, or the tile
                         // stayed pushed and leaning and the limit sound ran on while the key was held.
-                        if (down && !focusManager.moveFocus(dir) && e.nativeKeyEvent.repeatCount == 0) {
+                        val found = down && focusManager.moveFocus(dir)
+                        if (dock && dir == FocusDirection.Down && !found) return@onKeyEvent true
+                        if (down && !found && e.nativeKeyEvent.repeatCount == 0) {
                             Sounds.limit()
                             when (dir) {
                                 FocusDirection.Left -> nudge(-1f, 0f)
@@ -380,7 +393,10 @@ fun AppTile(
                 .pointerInput(enabled) {
                     if (!enabled) return@pointerInput
                     detectTapGestures(
+                        // The press, not the lift: a finger on a tile under the hero takes the
+                        // hero away first, and what follows is an ordinary press on the dock.
                         onPress = {
+                            onDockTouch()
                             pressed = true
                             tryAwaitRelease()
                             pressed = false

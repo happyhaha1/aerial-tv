@@ -25,6 +25,7 @@ import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.draggable
 import androidx.compose.foundation.gestures.rememberDraggableState
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.fillMaxSize
@@ -73,6 +74,8 @@ import app.orchard.tv.apps.SourceLooks
 import app.orchard.tv.HomeViewModel
 import app.orchard.tv.Overlay
 import app.orchard.tv.R
+import app.orchard.tv.fnos.FnosPlayItem
+import app.orchard.tv.fnos.FnosShelf
 import app.orchard.tv.settings.AerialSettings
 import app.orchard.tv.apps.AppEntry
 import app.orchard.tv.ui.control.ControlCenter
@@ -84,11 +87,14 @@ import app.orchard.tv.ui.components.liquidGlass
 import app.orchard.tv.ui.theme.LocalReducedMotion
 import app.orchard.tv.ui.theme.Motion
 import app.orchard.tv.ui.theme.Type
+import app.orchard.tv.ui.theme.canvasDensity
 import androidx.compose.runtime.snapshotFlow
 import app.orchard.tv.system.DiagLog
 import app.orchard.tv.system.SystemProbe
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
+import app.orchard.tv.system.NetworkStatus
+import java.time.LocalDateTime
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
@@ -99,6 +105,29 @@ import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
 
+/** The FN TV app, whose tile carries Home's Top Shelf (docs/FNOS-PLAYER.md). */
+private const val FnosPackage = "com.trim.tv"
+
+/**
+ * The header's row, as Home shows it over the wallpaper and the hero over its artwork: the time,
+ * ticking on the minute, and the one status pill Home focuses and opens Control Center from. Made
+ * once by [HomeScreen], so the row the hero draws and the row Home draws are the same pill.
+ */
+private class Header(now: LocalDateTime, val pillRequester: FocusRequester) {
+    var now: LocalDateTime by mutableStateOf(now)
+}
+
+/** The header's row sits where Home has always kept its small clock, level with the pill. */
+private val HeaderTop = 28.dp
+
+/** The pill's room for its focus glow, past the header's end: it lines up with the tiles' edge. */
+private val HeaderPillGlow = 14.dp
+
+/** The time and weather's room before the pill, where they sit beside it on the right. */
+private val HeaderTimePillGap = 14.dp
+
+/** Space the hero's page dots keep above the dock's plate. */
+private val HeroDotsRoom = 52.dp
 /** The plate's distance from the bottom edge with no second row peeking: as from the sides. */
 private val PlateMarginBottom = 30.dp
 
@@ -271,6 +300,9 @@ private const val HOME_SHOT_AFTER_MS = 450L
 /** How often that picture is taken again while Control Center stays open, for the clock. */
 private const val HOME_SHOT_EVERY_MS = 30_000L
 
+internal fun heroVisible(focusedKey: String?, shelfKey: String?, heroFocused: Boolean, pillFocused: Boolean) =
+    shelfKey != null && (focusedKey == shelfKey || heroFocused || pillFocused)
+
 @Composable
 fun HomeScreen(
     vm: HomeViewModel,
@@ -279,6 +311,7 @@ fun HomeScreen(
     onAppInfo: (String) -> Unit,
     onUninstall: (String) -> Unit,
     onStartScreensaver: () -> Unit,
+    onPlayFilm: (FnosPlayItem, Rect?) -> Unit = { _, _ -> },
 ) {
     val apps = vm.apps
     val overlay = vm.overlay
@@ -305,7 +338,23 @@ fun HomeScreen(
     var lastFocusedIndex by remember { mutableStateOf(0) }
     val focusedIndex = apps.indexOfFirst { it.key == focusedKey }
     val columns = AerialSettings.homeColumns
+    // Home's Top Shelf, as tvOS has one: it belongs only to the FN TV tile and the two controls
+    // reached from that tile. Horizontal focus on another app must restore the normal wallpaper.
+    val shelfKey = remember(apps) { apps.firstOrNull { it.packageName == FnosPackage }?.key }
+    val heroItems = FnosShelf.resumable
+    val heroItem = FnosShelf.hero
+    val heroSession = FnosShelf.sessionFor
+    // The hero keeps focus once it has it, so a step to another title does not drop back to the dock.
+    var heroFocused by remember { mutableStateOf(false) }
+    val heroRequester = remember { FocusRequester() }
+    // Keep the owner's app order while the hero is visible.
+    val heroApps = apps
+    val fnOnDock = shelfKey != null && apps.take(columns).any { it.key == shelfKey }
     val focusedRow = if (pillFocused || focusedIndex < 0) 0 else focusedIndex / columns
+    // Mount for the FN tile itself and while focus is in its Resume/header path. A row-wide gate
+    // left the FN artwork up after Right moved focus to Mango TV.
+    val heroOn = overlay == Overlay.None && moving == null && fnOnDock &&
+        heroVisible(focusedKey, shelfKey, heroFocused, pillFocused)
     val gridEnabled = overlay == Overlay.None
 
     // The aerial wallpaper's film, and how far it shows through.
@@ -399,6 +448,10 @@ fun HomeScreen(
         }
     }
 
+    // The header's row (HomeChrome): Home draws it, and so does the hero over its artwork, with the
+    // time it keeps and the one pill Home's Up leads to.
+    val header = remember { Header(now, pillRequester) }
+    header.now = now
     // Grid scroll offset (px). The remote sets it from the focused row; a finger drags it freely
     // (issue #60), and then it stays where the finger left it until the next key press.
     val scroll = remember { Animatable(0f) }
@@ -408,6 +461,27 @@ fun HomeScreen(
     fun focusApp(index: Int) {
         val app = apps.getOrNull(index.coerceIn(0, (apps.size - 1).coerceAtLeast(0))) ?: return
         runCatching { requester(app.key).requestFocus() }
+    }
+
+    // The hero's step Up to the header's pill, made here: the state settles first, so Home's effects
+    // and the pill's onFocusChanged hear of the move before focus lands; the request then runs once
+    // the frame is laid out. The pill is drawn under the hero's own header, so it takes focus then.
+    fun focusPill() {
+        heroFocused = false
+        pillFocused = true
+        scope.launch { withFrameNanos { }; runCatching { pillRequester.requestFocus() } }
+    }
+
+    // Down or Back from the hero: the FN app's own tile on the dock, which is where Up came from.
+    fun focusDock() {
+        heroFocused = false
+        pillFocused = false
+        val index = apps.indexOfFirst { it.key == shelfKey }
+        if (index >= 0) {
+            focusedKey = shelfKey
+            lastFocusedIndex = index
+            focusApp(index)
+        } else focusApp(lastFocusedIndex)
     }
 
     // First focus once the apps are in; afterwards, put focus back wherever it was when an overlay closes.
@@ -452,6 +526,15 @@ fun HomeScreen(
             vm.homeResetPending = false
         }
     }
+    // Up from the FN app's own tile mounts the hero's Resume button: the mount is a frame away, so
+    // the request waits for it. Up from the header's pill asks for the pill itself (focusPill), and
+    // the way back out — Down, Back, another tile — is focusDock and the tile's own focus, so this
+    // effect never pulls focus away from where the remote just went.
+    LaunchedEffect(heroOn, heroFocused, focusedKey) {
+        if (!heroOn || !heroFocused || focusedKey != shelfKey) return@LaunchedEffect
+        withFrameNanos { }
+        runCatching { heroRequester.requestFocus() }
+    }
 
     BackHandler(enabled = overlay == Overlay.None && moving == null) {
         // tvOS: Back from inside the grid returns to the top row; Back on the top row starts the
@@ -488,7 +571,43 @@ fun HomeScreen(
                     }
                     return@onPreviewKeyEvent true
                 }
-                if (e.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+                // Up from the FN app steps into its Top Shelf, as Up from tvOS's dock does; that is
+                // the hero's own focus, as Up from its Resume button is. From there Up goes to the
+                // header's pill, lower down, and Down or Back comes back down to this tile.
+                if (e.type == KeyEventType.KeyDown && !heroFocused && !pillFocused && fnOnDock &&
+                    focusedKey == shelfKey && e.nativeKeyEvent.keyCode == NativeKeyEvent.KEYCODE_DPAD_UP
+                ) {
+                    heroFocused = true
+                    return@onPreviewKeyEvent true
+                }
+                // Held on the Resume button, the vertical steps are routed here too, so the focus
+                // search never leaves one of these three places for another: Up to the header's pill,
+                // Down and Back to the tile on the dock under it. Left and right step to the next
+                // title; a press landing a frame before the request took would otherwise wander off
+                // into the dock.
+                if ((e.type == KeyEventType.KeyDown || e.type == KeyEventType.KeyUp) && heroFocused && !pillFocused) {
+                    val down = e.type == KeyEventType.KeyDown
+                    when (e.nativeKeyEvent.keyCode) {
+                        NativeKeyEvent.KEYCODE_DPAD_LEFT -> {
+                            if (down && heroItem != null) FnosShelf.step(-1)
+                            return@onPreviewKeyEvent true
+                        }
+                        NativeKeyEvent.KEYCODE_DPAD_RIGHT -> {
+                            if (down && heroItem != null) FnosShelf.step(1)
+                            return@onPreviewKeyEvent true
+                        }
+                        // Down leaves the hero for the tile under it, and Back the same way: never
+                        // the screensaver, and never left to the focus search.
+                        NativeKeyEvent.KEYCODE_DPAD_DOWN, NativeKeyEvent.KEYCODE_BACK -> {
+                            if (down) focusDock()
+                            return@onPreviewKeyEvent true
+                        }
+                        NativeKeyEvent.KEYCODE_DPAD_UP -> {
+                            if (down) focusPill()
+                            return@onPreviewKeyEvent true
+                        }
+                    }
+                }
                 when (e.nativeKeyEvent.keyCode) {
                     NativeKeyEvent.KEYCODE_MENU -> {
                         // On an app tile, Menu opens that app's menu (AppTile): remotes whose held
@@ -595,7 +714,8 @@ fun HomeScreen(
         // its picture stands in under Control Center, and a SurfaceView in a layer that is not
         // drawn cuts no hole in the window, so the paused film showed as the window's black
         // (Xiaomi MiTV-MFTR0, the aerial wallpaper under Control Center).
-        val filmMoves = vm.resumed && overlay == Overlay.None && !vm.screensaverVisible && !pastShelf &&
+        // The hero's artwork covers the screen, so the film rests under it.
+        val filmMoves = vm.resumed && !heroOn && overlay == Overlay.None && !vm.screensaverVisible && !pastShelf &&
             !inGrid && moving == null
         val sourceInput = Wallpapers.sourceInput
         when {
@@ -663,6 +783,7 @@ fun HomeScreen(
                     (metrics.topRowY + metrics.tileH + PlatePadV + metrics.firstGap + second).toPx(),
                 )
             }
+
             // Another wallpaper chosen: nothing shows through until the new one has a frame.
             LaunchedEffect(Wallpapers.selectedId) { filmCover.snapTo(0f) }
             // The aerial film's own glass for the grid: the one playing or stopped, else the one
@@ -671,6 +792,83 @@ fun HomeScreen(
             val clip = if (Wallpapers.selectedId == Wallpapers.LIVE) liveFilm.film?.id ?: pictureClip else null
             LaunchedEffect(clip) { Wallpapers.showClipGlass(clip) }
             val clipGlass = Wallpapers.clipGlass?.takeIf { it.first == clip }?.second
+
+        // Artwork sits behind the glass Dock and its tiles.
+        if (heroOn) {
+            // Asked for at the screen's own pixels: 1080p on the 960×540 canvas, 4K on a 4K one.
+            val screen = LocalContext.current.resources.displayMetrics
+            val heroPx = remember(screen.widthPixels, screen.density) {
+                (HeroWidth * (canvasDensity(screen) / screen.density)).toInt()
+            }
+            val art = heroArt(
+                heroItem,
+                heroSession?.host.orEmpty(),
+                heroSession?.token,
+                heroSession?.user.orEmpty(),
+                heroPx,
+            )
+            // With nothing to resume the wallpaper stays, and the text says why: no server set
+            // up, a sign-in that lapsed, the NAS away, or everything watched.
+            val notice = when {
+                heroItem != null -> null
+                FnosShelf.loading -> stringResource(R.string.fnos_loading)
+                FnosShelf.problem == FnosShelf.ShelfProblem.NotSetUp -> stringResource(R.string.fnos_signin)
+                FnosShelf.problem == FnosShelf.ShelfProblem.SignedOut -> stringResource(R.string.fnos_signin)
+                FnosShelf.problem == FnosShelf.ShelfProblem.Unreachable -> stringResource(R.string.fnos_offline)
+                // Everything watched, or none yet: the heading the card row used to carry.
+                else -> stringResource(R.string.fnos_continue)
+            }
+            HeroTitle(
+                item = heroItem,
+                count = heroItems.size,
+                index = FnosShelf.heroIndex,
+                art = art,
+                notice = notice,
+                enabled = gridEnabled && moving == null,
+                focusRequester = heroRequester,
+                onFocused = { gained ->
+                    heroFocused = gained
+                    if (gained) { focusedKey = shelfKey; pillFocused = false }
+                },
+                onStep = { d -> FnosShelf.step(d) },
+                // Up to the header's pill, and Down or Back to the tile under the hero, both made
+                // here as Home's own keys are: one state, one request, and the artwork comes down.
+                onPill = { focusPill() },
+                onDock = { focusDock() },
+                onPlay = { heroItem?.let { onPlayFilm(it, null) } },
+                margin = metrics.margin,
+                // Under the header's row, where Apple TV keeps its title: the time and weather keep
+                // the top left as on Home, and the pill the top right, where Up from the title leads.
+                titleTop = metrics.clockY + 28.dp,
+                dotsY = metrics.topRowY - HeroDotsRoom,
+                withChrome = true,
+                chrome = {
+                    // The same row as Home's, with the margin already around it: the time and weather
+                    // at the left edge of the title's column, the pill at the right edge of the tiles.
+                    HeaderCapsule(
+                        header = header,
+                        network = vm.network,
+                        largeClock = AerialSettings.largeClock,
+                        clockRight = AerialSettings.clockRight,
+                        showTime = true,
+                        faded = { 0f },
+                        saver = { toSaver.value },
+                        heroOn = true,
+                        hidden = false,
+                        margin = 0.dp,
+                        onPillFocused = { gained -> if (gained) { pillFocused = true; heroFocused = false } },
+                        onPillClick = {
+                            // A tap focuses the pill and opens Control Center before onFocused
+                            // hears of it: the hero must know it is not where focus is, or its
+                            // artwork would come back up over the closing panel.
+                            pillFocused = true
+                            heroFocused = false
+                            vm.overlay = Overlay.ControlCenter()
+                        },
+                    )
+                },
+            )
+        }
             HomeBackground(
                 // The chosen wallpaper; in "Follow App" mode, light from the focused app.
                 backdrop = Wallpapers.backdrop ?: ambientApp?.art?.backdrop,
@@ -678,11 +876,13 @@ fun HomeScreen(
                 plate = plate,
                 scroll = { scroll.value },
                 collapse = collapsePx,
-                cover = { filmCover.value },
+                // The hero replaces only the wallpaper; its Dock glass remains visible.
+                cover = { if (heroOn) 1f else filmCover.value },
                 // A film kept moving, or an input's picture, gets the shade a picture has, so the
                 // top row reads over it without the plate. In the grid both give way to the
                 // glass, as any wallpaper does (an input's picture cannot be blurred).
                 shadeMoving = Wallpapers.keepsMoving || sourceInput != null,
+                plateCover = { if (heroOn) 0f else filmCover.value },
                 filmStopped = { filmStopped },
                 toSaver = { toSaver.value },
                 filmGlass = (Wallpapers.filmFrost ?: Wallpapers.frosted).takeIf { Wallpapers.moves() && Wallpapers.backdrop != null },
@@ -712,8 +912,9 @@ fun HomeScreen(
             ) {
                 val clockRight = AerialSettings.clockRight
                 // The large clock stands over the top row; the small one is the time and weather in
-                // one line, top left or beside the pill, so the wallpaper keeps the screen.
-                if (AerialSettings.largeClock) {
+                // one line, top left or beside the pill, so the wallpaper keeps the screen. The
+                // hero draws that line over its own artwork, so Home's clocks stand down then.
+                if (AerialSettings.largeClock && !heroOn) {
                     ShelfClock(
                         now = now,
                         alignEnd = clockRight,
@@ -731,7 +932,7 @@ fun HomeScreen(
                         saving = vm.screensaverVisible,
                         away = carrying,
                     )
-                } else if (!clockRight) {
+                } else if (!clockRight && !heroOn) {
                     CornerClock(
                         now = now,
                         modifier = Modifier
@@ -752,7 +953,11 @@ fun HomeScreen(
                     !peek -> columns
                     else -> Int.MAX_VALUE
                 }
-                apps.forEachIndexed { index, app ->
+                // The dock the hero stands over: the FN app first, then its neighbours; off it is
+                // the grid as it was, unchanged. Focus indexes refer to `apps`, so slots stay put.
+                val dockApps = if (heroOn) heroApps else apps
+                dockApps.forEachIndexed { index, app ->
+                    val gridIndex = apps.indexOfFirst { it.key == app.key }.coerceAtLeast(0)
                     key(app.key) {
                         val (x, y) = metrics.slot(index, onTop = !inGrid)
                         val slotPx = with(density) { IntOffset(x.roundToPx(), y.roundToPx()) }
@@ -771,8 +976,13 @@ fun HomeScreen(
                             appearDelayMs = (index * 28).coerceAtMost(320),
                             onFocused = {
                                 focusedKey = app.key
-                                lastFocusedIndex = index
+                                lastFocusedIndex = gridIndex
                                 pillFocused = false
+                                // A tile that takes focus is where the remote is now, however it got
+                                // there (Down or Back from the hero, a folder closing under it):
+                                // leaving the hero's state behind only let the hero's effect and
+                                // keys answer presses meant for this tile.
+                                heroFocused = false
                             },
                             onClick = { bounds ->
                                 val mover = moving
@@ -782,7 +992,7 @@ fun HomeScreen(
                                     else {
                                         // Closing the folder comes back to its tile.
                                         focusAfterOverlay = app.key
-                                        indexAfterOverlay = index
+                                        indexAfterOverlay = gridIndex
                                         vm.overlay = Overlay.Folder(folder.id)
                                     }
                                 }
@@ -790,22 +1000,25 @@ fun HomeScreen(
                                 // itself is done.
                                 else if (mover == app.key) vm.endMove()
                                 else {
-                                    vm.moveBy(index - apps.indexOfFirst { it.key == mover })
+                                    vm.moveBy(gridIndex - apps.indexOfFirst { it.key == mover })
                                     runCatching { requester(mover).requestFocus() }
                                 }
                             },
                             onLongPress = { bounds ->
                                 if (moving == null) {
                                     focusAfterOverlay = app.key
-                                    indexAfterOverlay = index
+                                    indexAfterOverlay = gridIndex
                                     vm.overlay = Overlay.AppMenu(app.key, bounds ?: Rect.Zero)
                                 }
                             },
+                            // A finger on the dock takes the hero away; its Up then steps back into
+                            // the hero, and Down or Back from the hero steps back down to the tile.
+                            onDockTouch = { if (heroOn) heroFocused = false },
                             modifier = Modifier
                                 // Lifted on the shelf with the plate; the clock above stays put.
                                 .offset { slot.value - IntOffset(0, lift.roundToInt()) }
                                 .then(
-                                    if (index >= hiddenFrom) Modifier.graphicsLayer {
+                                    if (index >= hiddenFrom || (heroOn && gridIndex >= columns)) Modifier.graphicsLayer {
                                         alpha = (scroll.value / collapsePx * 2.5f).coerceIn(0f, 1f)
                                         // No offscreen buffer: it would clip the focus frame to the tile.
                                         compositingStrategy = CompositingStrategy.ModulateAlpha
@@ -813,87 +1026,70 @@ fun HomeScreen(
                                 )
                                 // Into the screensaver, the apps go left to right, sinking a little.
                                 .graphicsLayer {
-                                    val f = ((toSaver.value - 0.05f * (index % columns)) / 0.6f).coerceIn(0f, 1f)
+                                    val f = ((toSaver.value - 0.05f * (gridIndex % columns)) / 0.6f).coerceIn(0f, 1f)
                                     if (f > 0f) {
                                         alpha = 1f - f
                                         translationY = f * 18.dp.toPx()
                                         compositingStrategy = if (saverFadeOffscreen) CompositingStrategy.Offscreen else CompositingStrategy.ModulateAlpha
                                     }
                                 },
-                            rowEnd = index % columns == columns - 1 || index == apps.lastIndex,
+                            rowEnd = index % columns == columns - 1 || index == dockApps.lastIndex,
                             // On the glass plate only with every name shown (an earlier build showed
                             // the focused one alone there, but it sat oddly on the glass).
                             showName = plate == null || index >= columns * metrics.shelfRows || plateNames,
                             nameOnPlate = plate != null && index < columns * metrics.shelfRows,
+                            // Up from the dock belongs to the hero while it is up.
+                            dock = heroOn,
                         )
                     }
                 }
             }
         }
 
+
         homeShot?.let { shot -> Canvas(Modifier.fillMaxSize()) { drawImage(shot) } }
         PanelBackdrop(Wallpapers.frosted.takeIf { Wallpapers.backdrop != null }, { backdropFrost }, { backdropVeil })
 
-        // The pill holds only the network and Control Center. The time joins it once the clock
-        // above the top row has scrolled away, so the screen never shows the time twice. The small
-        // clock on the right puts the time and weather just left of the pill.
-        Row(
-            Modifier
-                .align(Alignment.TopEnd)
-                .padding(top = 28.dp, end = metrics.margin - 14.dp)
-                .graphicsLayer { alpha = if (overlay is Overlay.ControlCenter) 0f else 1f },
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            if (!AerialSettings.largeClock && AerialSettings.clockRight) {
-                CornerClock(
-                    now = now,
-                    modifier = Modifier
-                        .padding(end = 14.dp)
-                        .graphicsLayer {
-                            alpha = 1f - (scroll.value / collapsePx * 1.6f).coerceIn(0f, 1f)
-                            compositingStrategy = CompositingStrategy.ModulateAlpha
-                        },
-                    toSaver = { toSaver.value },
-                    saving = vm.screensaverVisible,
-                )
-            }
-            StatusPill(
-                now = now,
-                network = vm.network,
-                showTime = if (dragged) pastShelf else inGrid,
-                enabled = gridEnabled && moving == null,
-                focusRequester = pillRequester,
-                modifier = Modifier
-                    // Down goes back to the top-row tile Up came from, not to the nearest one,
-                    // which under the pill is the last of the row (issue #703).
-                    .focusProperties {
-                        val key = focusedKey
-                        if (key != null && apps.indexOfFirst { it.key == key } in 0 until columns) down = requester(key)
-                    }
-                    .graphicsLayer {
-                        alpha = 1f - (toSaver.value * 2f).coerceIn(0f, 1f)
-                        // No offscreen buffer: it would cut the focused pill's 8% growth to a box.
-                        compositingStrategy = CompositingStrategy.ModulateAlpha
-                    },
-                onFocused = { gained ->
-                    // The window hands its first focus to the top-most control; the top row is where Home starts.
-                    if (gained) {
-                        if (focusedKey == null) {
-                            if (apps.isNotEmpty()) focusApp(0)
-                        } else {
-                            pillFocused = true
-                        }
-                    }
-                },
-                onClick = {
-                    // A tap focuses the pill and opens Control Center in the same frame, before
-                    // onFocused hears of it: note it here so focus comes back to the pill.
-                    pillFocused = true
-                    vm.overlay = Overlay.ControlCenter()
-                },
-            )
-        }
 
+
+        // The header's row, the time and weather and the pill, kept out of the drawer so the rows
+        // under it scroll while it stays put. With the hero up the hero draws the same row over its
+        // artwork, so this one stands down then: one pill on screen, and the one Up leads to.
+        HeaderCapsule(
+            header = header,
+            network = vm.network,
+            largeClock = AerialSettings.largeClock,
+            clockRight = AerialSettings.clockRight,
+            showTime = if (dragged) pastShelf else inGrid,
+            faded = { scroll.value / collapsePx },
+            saver = { toSaver.value },
+            heroOn = heroOn,
+            hidden = heroOn,
+            margin = metrics.margin,
+            enabled = gridEnabled && moving == null,
+            // Down goes back to the top-row tile Up came from, not to the nearest one, which
+            // under the pill is the last of the row (issue #703).
+            pillModifier = Modifier.focusProperties {
+                val key = focusedKey
+                if (key != null && apps.indexOfFirst { it.key == key } in 0 until columns) down = requester(key)
+            },
+            onPillFocused = { gained ->
+                // The window hands its first focus to the top-most control; the top row is where Home starts.
+                if (gained) {
+                    if (focusedKey == null) {
+                        if (apps.isNotEmpty()) focusApp(0)
+                    } else {
+                        pillFocused = true
+                    }
+                }
+            },
+            onPillClick = {
+                // A tap focuses the pill and opens Control Center in the same frame, before
+                // onFocused hears of it: note it here so focus comes back to the pill.
+                pillFocused = true
+                vm.overlay = Overlay.ControlCenter()
+            },
+        )
         AnimatedVisibility(
             visible = moving != null,
             enter = fadeIn(tween(200, easing = Motion.EaseOut)) + slideInVertically(tween(260, easing = Motion.EaseOut)) { it / 2 },
@@ -1050,5 +1246,86 @@ fun HomeScreen(
                 else -> null
             },
         )
+    }
+}
+
+/**
+ * Home's header row: the time and weather at the tiles' left and the pill at the right. It stands
+ * outside the drawer, so the rows under it scroll while it keeps its place, and the hero draws the
+ * same row over its artwork as its chrome. With the hero up the large clock is not drawn, so the
+ * time and weather are the small line — which on the right would be the pill's neighbour, and moves
+ * beside it there instead — and the pill carries the time, as it does once the grid covers the clock.
+ *
+ * The pill is drawn here, past the drawer's dimming for the running screensaver: that dimming is the
+ * picture's, and the network and Control Center stay readable over it.
+ */
+@Composable
+private fun HeaderCapsule(
+    header: Header,
+    network: NetworkStatus,
+    largeClock: Boolean,
+    clockRight: Boolean,
+    /** The row's time has scrolled away under the drawer; the pill says the time instead. */
+    showTime: Boolean,
+    /** How far the rows have scrolled: the time fades out with them, as the large clock does. */
+    faded: () -> Float,
+    saver: () -> Float,
+    heroOn: Boolean,
+    /** The hero's own drawing of this row is up: this one stands down, so there is one pill. */
+    hidden: Boolean,
+    margin: Dp,
+    /** The pill's own keys: Down returns to the top-row tile Up came from (issue #703). */
+    pillModifier: Modifier = Modifier,
+    /** The pill answers focus and taps only while Home's controls are live. */
+    enabled: Boolean = true,
+    onPillFocused: (Boolean) -> Unit,
+    onPillClick: () -> Unit,
+) {
+    if (hidden) return
+    Box(Modifier.fillMaxSize()) {
+        // Home's own clock stands above the drawer (the large one, or the small line top left); this
+        // row draws the small line only as the hero's header, over its artwork.
+        if (heroOn && !clockRight) {
+            CornerClock(
+                now = header.now,
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .padding(start = margin, top = HeaderTop)
+                    .graphicsLayer { alpha = 1f - (faded() * 1.6f).coerceIn(0f, 1f) },
+                toSaver = saver,
+            )
+        }
+        Row(
+            Modifier
+                .align(Alignment.TopEnd)
+                .padding(top = HeaderTop, end = (margin - HeaderPillGlow).coerceAtLeast(0.dp)),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            // Beside the pill on the right, and on the hero's header on the left of it: the hero's
+            // left column is the title's.
+            if ((!largeClock || heroOn) && clockRight) {
+                CornerClock(
+                    now = header.now,
+                    modifier = Modifier
+                        .padding(end = HeaderTimePillGap)
+                        .graphicsLayer { alpha = 1f - (faded() * 1.6f).coerceIn(0f, 1f) },
+                    toSaver = saver,
+                )
+            }
+            StatusPill(
+                now = header.now,
+                network = network,
+                showTime = showTime,
+                enabled = enabled,
+                focusRequester = header.pillRequester,
+                modifier = Modifier.graphicsLayer {
+                    alpha = 1f - (saver() * 2f).coerceIn(0f, 1f)
+                    // No offscreen buffer: it would cut the focused pill's 8% growth to a box.
+                    compositingStrategy = CompositingStrategy.ModulateAlpha
+                }.then(pillModifier),
+                onFocused = onPillFocused,
+                onClick = onPillClick,
+            )
+        }
     }
 }

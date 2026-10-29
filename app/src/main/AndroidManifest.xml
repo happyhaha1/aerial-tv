@@ -84,6 +84,12 @@
              Not in recent apps: where the firmware keeps Home for itself, Aerial's task is a standard
              one and showed as a card first in the list that switched to nothing (MiTV-MFTR0, #324). -->
         <activity
+            android:name=".PlayerActivity"
+            android:exported="false"
+            android:launchMode="singleTop"
+            android:configChanges="keyboard|keyboardHidden|navigation|orientation|screenSize|smallestScreenSize|screenLayout|uiMode"
+            android:theme="@style/Theme.Aerial" />
+        <activity
             android:name=".MainActivity"
             android:exported="true"
             android:directBootAware="true"

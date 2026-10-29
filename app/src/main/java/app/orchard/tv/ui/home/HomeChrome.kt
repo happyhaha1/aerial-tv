@@ -28,6 +28,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.ui.graphics.asAndroidBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -208,7 +209,7 @@ fun HomeBackground(
     plate: Rect?,
     scroll: () -> Float,
     collapse: Float,
-    /** How far the aerial wallpaper's film shows through (LiveWallpaper): picture and plate give way to it. */
+    /** How far the aerial wallpaper's film shows through (LiveWallpaper): the picture gives way to it. */
     cover: () -> Float = { 0f },
     /** Shade the film while it moves, as its picture would be shaded. */
     shadeMoving: Boolean = false,
@@ -242,6 +243,11 @@ fun HomeBackground(
     glassAwaitsStop: Boolean = false,
     /** The grid's own glass, where it is not the picture's ([frosted]): the aerial film's (Wallpapers.clipGlass). */
     gridGlass: ImageBitmap? = null,
+    /**
+     * How far the plate itself gives way where that is not [cover]: the hero's artwork covers the
+     * wallpaper while its Dock plate stays visible.
+     */
+    plateCover: () -> Float = cover,
 ) {
     Box(Modifier.fillMaxSize()) {
         // Over a paused film, under the pictures: the shading its picture will have. The picture
@@ -258,7 +264,7 @@ fun HomeBackground(
             val a = saverReveal()
             if (a > 0.01f) drawDrawingIn(saverImage, saverPush(), a)
         }
-        Plate(frosted ?: backdrop, filmGlass, plate, scroll, collapse, cover, filmStopped, toSaver, lift)
+        Plate(frosted ?: backdrop, filmGlass, plate, scroll, collapse, plateCover, filmStopped, toSaver, lift)
     }
 }
 
@@ -344,9 +350,10 @@ private fun Pictures(
 
 /**
  * The plate under the top row, one layer over whatever is behind it: the picture, or the film
- * once stopped. It gives way only to a moving film, so the swap from the paused film to its
- * picture leaves it as it is. A new glass fades in over the old one, which stays whole beneath
- * it: two plates fading against each other let what is behind show through halfway.
+ * once stopped. It gives way where [plateCover] says the film shows through, so the swap from the
+ * paused film to its picture leaves it as it is. A new glass fades in over the old one, which
+ * stays whole beneath it: two plates fading against each other let what is behind show through
+ * halfway.
  *
  * Under it, while a film moves, the film's plate ([film]): a film under the window cannot be
  * blurred, so a small key frame of it, frosted, a few seconds old (LiveWallpaper), lies
@@ -356,13 +363,13 @@ private fun Pictures(
  * moves or a new frame fades in, every [GLASS_EVERY_MS]: the film plays with Compose all but still.
  */
 @Composable
-private fun Plate(glass: ImageBitmap?, film: ImageBitmap?, plate: Rect?, scroll: () -> Float, collapse: Float, cover: () -> Float, filmStopped: () -> Float, toSaver: () -> Float, lift: () -> Float) {
+private fun Plate(glass: ImageBitmap?, film: ImageBitmap?, plate: Rect?, scroll: () -> Float, collapse: Float, plateCover: () -> Float, filmStopped: () -> Float, toSaver: () -> Float, lift: () -> Float) {
     var shown by remember { mutableStateOf(glass) }
     var under by remember { mutableStateOf<ImageBitmap?>(null) }
     val swap = remember { Animatable(1f) }
     fun visibility(): Float {
         val rest = 1f - smooth(((scroll() / collapse).coerceIn(0f, 1f) / 0.55f).coerceIn(0f, 1f))
-        return rest * (1f - cover() * (1f - filmStopped())) * (1f - toSaver())
+        return rest * (1f - plateCover() * (1f - filmStopped())) * (1f - toSaver())
     }
     LaunchedEffect(glass) {
         if (glass === shown) return@LaunchedEffect
@@ -403,7 +410,7 @@ private fun Plate(glass: ImageBitmap?, film: ImageBitmap?, plate: Rect?, scroll:
         }
         val baked = withContext(Dispatchers.Default) { bakePlate(plateTinted(film), screen, plate, with(density) { PlateCorner.toPx() }, 0f, edge = false) }
         // Not on screen: the new frame simply takes over.
-        if (filmTop == null || cover() < 0.01f) {
+        if (filmTop == null || plateCover() < 0.01f) {
             filmTop = baked
             filmBottom = null
             filmSwap.snapTo(1f)
@@ -426,7 +433,7 @@ private fun Plate(glass: ImageBitmap?, film: ImageBitmap?, plate: Rect?, scroll:
         val base = (1f - smooth(((scroll() / collapse).coerceIn(0f, 1f) / 0.55f).coerceIn(0f, 1f))) * (1f - toSaver())
         val frame = filmTop
         val edge = smoke
-        if (edge != null && cover() > 0.01f && alpha < 0.99f && base > 0.01f) {
+        if (edge != null && plateCover() > 0.01f && alpha < 0.99f && base > 0.01f) {
             val p = (scroll() / collapse).coerceIn(0f, 1f)
             val r = plate.translate(0f, -scroll() - lift()).inflate(PlateSwell.toPx() * smooth((p / 0.55f).coerceIn(0f, 1f)))
             val t = filmSwap.value

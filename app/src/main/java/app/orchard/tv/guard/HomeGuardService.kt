@@ -1111,6 +1111,7 @@ class HomeGuardService : AccessibilityService() {
             return
         }
         broughtBackAt = SystemClock.uptimeMillis()
+        app.orchard.tv.system.DiagLog.i("guard goHome last=$lastWindow resumed=$aerialResumed woke=$woke")
         runCatching {
             startActivity(MainActivity.bringBackIntent(this).putExtra(MainActivity.EXTRA_WOKE, woke))
         }.onFailure { Log.w(TAG, "could not bring Aerial Home to the front", it) }

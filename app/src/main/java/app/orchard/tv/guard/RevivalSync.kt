@@ -63,12 +63,14 @@ class RevivalSyncService : Service() {
             // Credential storage is still locked; the guard and the boot receiver catch up on unlock.
             if (!GuardSetup.isUserUnlocked(context)) return
             GuardSetup.ensureAdb(context)
-            // Runs after every settings write, mostly while the guard is fine (or not bound yet, right
-            // after Aerial is opened). Only a guard Android had switched off counts as a revival, or
-            // the LeTV check (GuardSetup.revivedOften) trips after a few writes.
-            if (HomeGuardService.isRunning || !GuardSetup.ensureEnabled(context)) return
-            Log.i(RevivalSync.TAG, "revived by the sync framework")
-            GuardSetup.noteRevival(context)
+            if (HomeGuardService.isRunning) return
+            // GMUI on XGIMI ironman (Android 8) can leave the enabled entry behind while the
+            // service is no longer running. Rebind that case too, without counting it as another
+            // revival on every settings sync (the LeTV repeated-stop check).
+            if (GuardSetup.ensureEnabled(context)) {
+                Log.i(RevivalSync.TAG, "revived by the sync framework")
+                GuardSetup.noteRevival(context)
+            }
             Handler(Looper.getMainLooper()).postDelayed({ GuardSetup.rebindIfStalled(context) }, 5_000)
         }
     }

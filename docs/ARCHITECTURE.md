@@ -2,6 +2,8 @@
 
 Android 应用（`app/`），Kotlin + Jetpack Compose（没有用 androidx.tv 和 Material，全部自绘）。包名 `app.orchard.tv`（产品名是 Aerial，包名沿用旧名 Orchard：改包名会让电视把它当成新 App，丢掉户主数据和全部授权），minSdk 21（Android 5.0），targetSdk 34，compileSdk 36。Compose 固定在 1.9.x（BOM 2025.11.01）：1.10 起要求 Android 6.0。比 Android 5.0 新的接口都要按 `Build.VERSION.SDK_INT` 判断，`./gradlew lintStandardRelease` 的 NewApi 检查能找出漏掉的地方。Android 4.0–4.4 的电视用另一个模块 `lite/`（Aerial Lite，原生 View，minSdk 14），见 `docs/LITE.md`。
 
+飞牛影视接入见 [FNOS-PLAYER.md](FNOS-PLAYER.md)：阶段 1（首页「继续观看」货架 + Aerial 内置播放器 + 断点回写）已实现；[DANMAKU.md](DANMAKU.md) 的弹幕仍是方案。
+
 ## 目录一览
 
 ```
@@ -21,7 +23,8 @@ app/src/main/java/app/orchard/tv/
 │   ├── theme/Glyphs.kt      图标：Material Symbols Rounded 实心款的路径（GlyphPaths.kt，Apache 2.0），控制中心的开关图标自绘
 │   ├── components/Pressable.kt  遥控器可按控件：按下缩放、只在「本控件上开始的按压」抬起时触发
 │   ├── components/LiquidGlass.kt  面板的 Liquid Glass 材质（取模糊版壁纸里面板身后的一块）和玻璃边缘
-│   ├── home/HomeScreen.kt   首页布局：网格几何、滚动、焦点管理、各浮层挂载、返回键
+│   ├── home/HomeScreen.kt   首页布局：网格几何、滚动、焦点管理、各浮层挂载、返回键、飞牛 Top Shelf
+│   ├── home/TopShelf.kt     Top Shelf：焦点在飞牛磁贴上时出现的继续观看行（ShelfCard、ShelfGlass 是卡片和它的玻璃底板）
 │   ├── home/AppTile.kt      单个磁贴：聚焦弹簧、阴影、柔光、视差、边缘回弹、长按、移动抖动
 │   ├── home/HomeChrome.kt   背景（AmbientBackground）、大时钟、右上角状态胶囊、时间格式
 │   ├── home/Overlays.kt     长按菜单、隐藏的 App 面板、MenuRow、MiniTile
@@ -40,6 +43,14 @@ app/src/main/java/app/orchard/tv/
 │   └── AerialSettings.kt    Aerial 自己的偏好（SharedPreferences "settings"）：焦点样式 FocusStyle（默认高对比度）、固定到主屏幕的信号源、开机信号源、屏保开始时间、家长密码（SHA-256，解锁 10 分钟或按 HOME 重新上锁）
 ├── update/
 │   └── Updates.kt           每 3 小时读一次官网 download/version.txt，有新版时控制中心提示；点「下载并安装」才下载 APK 并交给系统安装器（见「升级」）
+├── fnos/
+│   ├── FnosClient.kt        飞牛影视客户端：Authx 签名、play/list、play/info、stream、record、封面
+│   ├── FnosStore.kt         地址与账号（SharedPreferences "fnos"），token 只在内存
+│   ├── FnosShelf.kt         首页货架状态：列表、加载中、未设置/登录失效/连不上/为空
+│   └── FnosArt.kt           封面缓存（cache/fnos/<服务器>），先读盘再联网
+├── player/
+│   └── FnosDataSource.kt    Media3 DataSource：media/range + Range + 签名（播放器的取流）
+├── PlayerActivity.kt        内置播放器：play/info 续播、15 秒回写、自绘控制栏
 ├── weather/
 │   └── Weather.kt           时钟旁的天气：Open-Meteo 实时天气，城市来自手机页或 IP 定位
 ├── system/
@@ -51,7 +62,7 @@ app/src/main/java/app/orchard/tv/
 │   ├── HomeGuardService.kt  无障碍「桌面守护」：原桌面出现就切回、从磁贴进原桌面时临时拦 HOME、亮屏检查、ADB 保持
 │   ├── GuardSetup.kt        用 WRITE_SECURE_SETTINGS 重新开启守护 / 保持 ADB / 「已启用未绑定」时强制重绑
 │   ├── RevivalListener.kt   通知监听服务：被强杀后由系统重绑，借此复活并重开守护；10 分钟内复活 3 次以上时，看不到前台就不再抢 HOME（乐视 #63）
-│   ├── RevivalSync.kt       同步适配器（挂在 settings 上，带一个自己的账号）：系统不许通知监听的低内存 Android 9（小米 MFTP0，#72）上，强停后约 30–60 秒由同步框架拉起 Aerial 并重开守护；守护在运行时什么都不做
+│   ├── RevivalSync.kt       同步适配器（挂在 settings 上，带一个自己的账号）：通知监听不可用时，由设置同步拉起 Aerial；守护未运行时既补回被删除的启用记录，也重绑「记录还在、服务已停」的状态，保留其他无障碍服务
 │   ├── BootReceiver.kt      真正重启后的兜底
 │   └── ConfigReceiver.kt    ADB 专用配置入口（keep_adb、own_screensaver、clear_pin、export_tiles、check_update、update_test、device_profile、list_sources、open_source），要求发送方持有 WRITE_SECURE_SETTINGS
 └── dream/AerialDream.kt    系统级屏保（DreamService + Compose）
@@ -166,7 +177,7 @@ Logo 的大小统一：先在 256×256 的采样里找出 Logo 的范围，再�
 
 ## 手机配置（PhoneServer）
 
-NanoHTTPD 监听 8790 端口，路径前缀是 8 位随机令牌（每次打开面板都重新生成，二维码里带着）。只在壁纸面板打开时运行，关闭后再保留 5 分钟。接口：`GET /` 页面、`GET api/state`、`GET thumb/<id>`、`POST api/wallpaper|screensaver|delete`（表单）、`POST api/upload`（multipart，可多张）；`GET tile/<包名>`（磁贴现在的样子）、`POST api/icon`（multipart：`app` 加一张图片）、`POST api/icon/reset`、`POST api/weather/city`（`name`）、`POST api/weather/auto`、`POST api/folder/name`（`id`、`name`，Home 活着时经 `AppCatalog.renameFolder` 改名）、`POST api/app/name`（`app`、`name`：App 存进 `AppNames`，信号源存进 `SourceLooks`）、`POST api/source/pin`（`id`、`pinned=1|0`，经 `AppCatalog.pinSource`）、`POST api/layout`（`op` = move / movein / hide / unhide / folder / unfolder / ungroup，加 `key`、`target`、`folder`，经 `AppCatalog.layout`；家长密码开着时不给 unhide，`api/state` 的 `layout.hidden` 也是空的）。页面底部四个标签（壁纸、屏保、主屏幕、更多），操作单张照片或单个磁贴用底部弹层。页面在 `assets/web/index.html`。
+NanoHTTPD 监听 8790 端口，路径前缀是 8 位随机令牌（每次打开面板都重新生成，二维码里带着）。只在壁纸面板打开时运行，关闭后再保留 5 分钟。接口：`GET /` 页面、`POST api/fnos`（`host`、`user`、`password`，留空沿用已存的）、`POST api/fnos/test`、`POST api/fnos/clear`、`GET api/state`、`GET thumb/<id>`、`POST api/wallpaper|screensaver|delete`（表单）、`POST api/upload`（multipart，可多张）；`GET tile/<包名>`（磁贴现在的样子）、`POST api/icon`（multipart：`app` 加一张图片）、`POST api/icon/reset`、`POST api/weather/city`（`name`）、`POST api/weather/auto`、`POST api/folder/name`（`id`、`name`，Home 活着时经 `AppCatalog.renameFolder` 改名）、`POST api/app/name`（`app`、`name`：App 存进 `AppNames`，信号源存进 `SourceLooks`）、`POST api/source/pin`（`id`、`pinned=1|0`，经 `AppCatalog.pinSource`）、`POST api/layout`（`op` = move / movein / hide / unhide / folder / unfolder / ungroup，加 `key`、`target`、`folder`，经 `AppCatalog.layout`；家长密码开着时不给 unhide，`api/state` 的 `layout.hidden` 也是空的）。页面底部四个标签（壁纸、屏保、主屏幕、更多），操作单张照片或单个磁贴用底部弹层。页面在 `assets/web/index.html`。
 
 - **自定义图标**：图片裁成 16:9、1280×720 存成 PNG，有这张图的 App 直接当横幅画（`AppCatalog.entry`，排在系统 App 自绘磁贴前面）。磁贴缓存的键里带着图片的修改时间；`CustomIcons.version` 变化时 `HomeViewModel` 重新加载 App。电视上的长按菜单里有「恢复默认图标」。包名必须是已安装的 App，同时也保证它是一个合法的文件名。
 - **文件夹**（像 tvOS）：长按菜单「移到文件夹」→ 选已有的文件夹或「新建文件夹」。新文件夹占这个 App 原来的位置，名字按 App 自动起（系统 App 叫「系统应用」，其他叫「文件夹」，重名加数字），可在文件夹的长按菜单里从预设名字（`folder_names`）中改；电视上没有好用的输入法，所以不做自由输入。文件夹在 `LayoutStore` 的排序里占一个 `folder:<id>` 键，里面的 App 不再出现在排序里；存成 JSON（`folders`），只记包名。文件夹磁贴是 `folderEntry`，画面是 `TileArtFactory.forFolder`：半透明底板上三乘三排最多九个 App 的缩略图，只在里面的 App 变了时重画。打开文件夹是全屏的 `FolderView`：主屏模糊变暗，上面是名字和同样大小的磁贴；在里面长按，菜单第一项是「移出文件夹」（放到文件夹后面）而不是「移动」，关掉菜单回到文件夹。最后一个 App 移出后文件夹自动消失；「解散文件夹」把里面的 App 按顺序放回文件夹的位置。浮层（菜单、文件夹）关闭时，Compose 会先把焦点交给浮层下面的磁贴，所以打开时记下要回到哪个磁贴（`focusAfterOverlay`、`FolderView` 的 `menuKey`）。小米 MFTR0 上验证过：新建、放入、打开、文件夹里的菜单、重命名、移出、解散，测完排列和原来一样。

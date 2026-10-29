@@ -17,6 +17,10 @@ import app.orchard.tv.apps.IconLibrary
 import app.orchard.tv.apps.SourceDevice
 import app.orchard.tv.apps.SourceLooks
 import app.orchard.tv.apps.TileArtFactory
+import app.orchard.tv.danmaku.DanmuPrefs
+import app.orchard.tv.fnos.FnosClient
+import app.orchard.tv.fnos.FnosShelf
+import app.orchard.tv.fnos.FnosStore
 import app.orchard.tv.settings.AerialSettings
 import app.orchard.tv.system.Diagnostics
 import app.orchard.tv.system.currentNetwork
@@ -180,6 +184,51 @@ class PhoneServer private constructor(private val context: Context, private val 
                     onMain { Weather.useNetworkLocation() }
                     json(state())
                 }
+                // The fnos film library: its address and account, typed here rather than on a
+                // remote. Signing in happens on the TV, so the phone never holds the token.
+                session.method == Method.POST && path == "/api/fnos" -> {
+                    val f = form(session)
+                    val host = f["host"].orEmpty().trim()
+                    val user = f["user"].orEmpty().trim()
+                    // Reuse a blank password only for the saved server/account.
+                    val typed = f["password"].orEmpty()
+                    val pass = typed.ifEmpty { FnosStore.savedPassword(host, user) }
+                    val saved = host.isNotEmpty() && user.isNotEmpty() && pass.isNotEmpty()
+                    if (saved) {
+                        onMain {
+                            FnosStore.save(host, user, pass)
+                            FnosShelf.reset()
+                            FnosShelf.refresh(force = true)
+                        }
+                    }
+                    json(state().put("saved", saved))
+                }
+                session.method == Method.POST && path == "/api/fnos/clear" -> {
+                    onMain {
+                        FnosStore.clear()
+                        FnosShelf.reset()
+                    }
+                    json(state())
+                }
+                session.method == Method.POST && path == "/api/fnos/test" -> {
+                    val f = form(session)
+                    val host = f["host"].orEmpty().trim()
+                    val user = f["user"].orEmpty().trim()
+                    val pass = f["password"].orEmpty().ifEmpty { FnosStore.savedPassword(host, user) }
+                    val result = runBlocking(Dispatchers.IO) {
+                        if (host.isEmpty() || user.isEmpty() || pass.isEmpty()) {
+                            Result.failure(IllegalArgumentException())
+                        } else FnosClient(baseUrl = host, token = null).login(host, user, pass)
+                    }
+                    json(state().put("ok", result.isSuccess).put("message", result.exceptionOrNull()?.message.orEmpty()))
+                }
+                // The danmaku service's base URL, token path included. Nothing is signed in here:
+                // the token is a path segment the service itself checks on every request.
+                session.method == Method.POST && path == "/api/danmu" -> {
+                    val url = form(session)["server"].orEmpty().trim()
+                    onMain { DanmuPrefs.server = url }
+                    json(state())
+                }
                 else -> text(Response.Status.NOT_FOUND, "Not found")
             }
         }.getOrElse {
@@ -210,6 +259,15 @@ class PhoneServer private constructor(private val context: Context, private val 
             .put("wallpaperAlwaysMoves", AerialSettings.wallpaperAlwaysMoves)
             .put("showWeather", AerialSettings.showWeather)
             .put("screensaverClock", AerialSettings.screensaverClock)
+            .put("fnos", JSONObject()
+                .put("host", FnosStore.host)
+                .put("user", FnosStore.user)
+                .put("configured", FnosStore.configured)
+                .put("items", FnosShelf.items.size)
+                .put("problem", FnosShelf.problem?.name ?: "")
+                // The danmaku service is another address on the same NAS; its token travels in the
+                // URL path, so the page keeps the whole base URL as one field.
+                .put("danmu", DanmuPrefs.server))
             .put("wallpapers", list)
             .put("apps", JSONArray().apply {
                 // Pinned inputs first, then apps by the name Home shows. [default] is the name a
@@ -309,9 +367,8 @@ class PhoneServer private constructor(private val context: Context, private val 
     }
 
     /** An app on the TV or a pinned input: the only tiles a picture may be sent for. */
-    /** An app, a firmware shortcut such as Xiaomi's children's mode (issue #530), or a pinned input. */
     private fun installed(pkg: String) =
-        pkg.isNotEmpty() && (AppCatalog.loaded.any { it.key == pkg } || AppCatalog.pinnedSources.any { it.key == pkg })
+        (CustomIcons.isValidKey(pkg) && AppCatalog.loaded.any { it.key == pkg }) || AppCatalog.pinnedSources.any { it.key == pkg }
 
     /** The tile as Home shows it; with [own], as the app's own art would draw it. */
     private fun tile(pkg: String, own: Boolean = false): Response {
@@ -424,6 +481,10 @@ class PhoneServer private constructor(private val context: Context, private val 
         @Synchronized
         fun listen(context: Context): PhoneServer? {
             running?.let { if (it.isAlive) return it }
+            // The danmaku settings are this page's too (its address field is here): loaded before
+            // the server answers, and on main, so a save from the page before the player has ever
+            // run reaches the file instead of only memory. [DanmuPrefs.init] reads once.
+            runBlocking(Dispatchers.Main.immediate) { DanmuPrefs.init(context.applicationContext) }
             return runCatching {
                 PhoneServer(context.applicationContext, token(context)).also {
                     it.start(SOCKET_READ_TIMEOUT, true)

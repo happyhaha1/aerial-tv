@@ -63,6 +63,9 @@ import app.orchard.tv.ui.home.TileFaces
 import app.orchard.tv.ui.theme.FontWarmup
 import app.orchard.tv.ui.theme.canvasDensity
 import app.orchard.tv.ui.components.UhdCanvas
+import app.orchard.tv.fnos.FnosArt
+import app.orchard.tv.fnos.FnosShelf
+import app.orchard.tv.fnos.FnosStore
 import app.orchard.tv.settings.AerialSettings
 import app.orchard.tv.wallpaper.PhoneServer
 import app.orchard.tv.wallpaper.Wallpapers
@@ -223,6 +226,8 @@ class MainActivity : ComponentActivity() {
         AerialSettings.init(this)
         // After the settings: the artwork's size follows the number of apps a row.
         TileArtFactory.useCanvasDensity(canvasDensity(resources.displayMetrics) * uhd)
+        FnosStore.init(this)
+        FnosArt.init(this)
         Sounds.init(this)
         val reducedMotion = Settings.Global.getFloat(contentResolver, Settings.Global.ANIMATOR_DURATION_SCALE, 1f) == 0f
 
@@ -265,6 +270,7 @@ class MainActivity : ComponentActivity() {
                     onUninstall = { open(Intent(Intent.ACTION_DELETE, Uri.fromParts("package", it, null)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) },
                     // Posted so the key-up of the Back press that started it does not end it at once.
                     onStartScreensaver = { idleHandler.postDelayed({ startScreensaver(asked = true) }, 150) },
+                    onPlayFilm = ::playFilm,
                 )
             }
         }
@@ -766,6 +772,9 @@ class MainActivity : ComponentActivity() {
         GuardSetup.setHomeInFront(this, true)
         HomeGuardService.onAerialResumed()
         Updates.onHomeResumed()
+        // The shelf reads on every return to Home: a film watched in another app moves its card,
+        // and an idle desktop never touches the network.
+        FnosShelf.refresh()
         vm.refreshSystem()
         // Back in front by any route (Home was handled in onNewIntent, which runs first; Back from
         // the app lands here directly), so the next Home press is a Home-on-Home again.
@@ -832,6 +841,23 @@ class MainActivity : ComponentActivity() {
             // opens the source page of its settings service instead (issue #241).
             if (app.source != null && SystemProbe.openInputPicker(this)) return
             Toast.makeText(this, getString(R.string.launch_failed, app.label), Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    /** A card on the shelf: the film itself, in Aerial's own player. */
+    private fun playFilm(item: app.orchard.tv.fnos.FnosPlayItem, bounds: androidx.compose.ui.geometry.Rect?) {
+        // Release the wallpaper codec before the player Activity requests one, as screensavers do.
+        LiveFilm.onHome?.letDecoderGo()
+        FnosShelf.started()
+        val options = bounds?.let {
+            ActivityOptions.makeScaleUpAnimation(
+                window.decorView, it.left.toInt(), it.top.toInt(), it.width.toInt(), it.height.toInt(),
+            ).toBundle()
+        }
+        try {
+            startActivity(PlayerActivity.intent(this, item, null), options)
+        } catch (e: Exception) {
+            Toast.makeText(this, getString(R.string.launch_failed, item.tvTitle.ifBlank { item.title }), Toast.LENGTH_SHORT).show()
         }
     }
 

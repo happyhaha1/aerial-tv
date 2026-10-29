@@ -187,3 +187,11 @@ Home Guard is running. Press Home on the remote.
 ```
 
 装的是 1.14（`versionCode=15`）。安装输出**没有提到通知监听失败**，这一项是后来排查才发现的。后续覆盖升级到 1.16 时触发了上面的 APK 路径问题。
+
+## 明文 HTTP（飞牛影视 / 弹幕服务）
+
+这台是 Android 9（SDK 28），会按 `network_security_config.xml` 拒绝明文 HTTP。飞牛影视和弹幕服务是局域网里的 HTTP 设备，地址由户主在手机页输入，预先列不进配置，所以 2026-10-28 起本 fork 的配置里加了 `base-config cleartextTrafficPermitted="true"`（HTTPS 仍按系统证书校验）。
+
+没加之前的表现：手机页「测试连接」返回 `fnos -1: network: CLEARTEXT communication to <NAS> not permitted by network security policy`，首页续播 0 条、`problem=Unreachable`。极米 ironman（Android 8）上同一份 APK 不触发，容易误判成只坏在小米上。
+
+**签名**：这台 2026-10-21 装的是别人机器上用 `local/signing.keystore`（`e08962dc…`）签的版本。2026-10-28 换本机的包时那把钥匙已经不在了，只能卸载重装（`adb uninstall` + `adb install`）；重装后要重做无障碍绑定、`SYSTEM_ALERT_WINDOW`、`WRITE_SECURE_SETTINGS`、定位授权，以及手机页上的壁纸 / 屏保 / 布局 / 飞牛账号 / 弹幕地址。
